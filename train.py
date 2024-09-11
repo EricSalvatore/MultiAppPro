@@ -1,8 +1,8 @@
-    import torch
+import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing, HeteroConv, SAGEConv
+from torch_geometric.nn import MessagePassing, HeteroConv, SAGEConv, GCNConv
 from torch_geometric.data import HeteroData
 import numpy as np
 from ConstructData import *
@@ -28,7 +28,9 @@ nodes_features_list = [G.nodes.get('App_' + str(item))['features'].tolist() for 
 # 2024-09-11 dhj
 # 添加categories节点类别序列
 categories = ['education', 'gaming', 'tools', 'social', 'health']
-
+# 2024-09-11 dhj
+# 构建类别索引到node的映射
+idx_node_map = {}
 
 # 2024-09-11 dhj
 # 构建异构数据 这里构建异构数据是通过节点类型来进行的
@@ -51,6 +53,7 @@ def create_hetero_data(G, categories):
 
         # 为每种类别的节点创建一个节点到索引的映射
         node_idx_map[category] = {node: i for i, node in enumerate(node_indices)}
+        idx_node_map[category] = {i: node for i, node in enumerate(node_indices)}
 
     # 为异构数据添加边以及权重，连接相同类别的节点
     for category in categories:
@@ -94,8 +97,8 @@ class ReconstructorHGNN(nn.Module):
         existing_edge_types = meta_data[1]
 
         for connection in existing_edge_types:
-            conv1_map[connection] = SAGEConv((-1, -1), hidden_dim)
-            conv2_map[connection] = SAGEConv((-1, -1), out_dim)
+            conv1_map[connection] = GCNConv(-1, hidden_dim)
+            conv2_map[connection] = GCNConv(-1, out_dim)
 
         self.conv1 = HeteroConv(conv1_map, aggr='sum')
         self.conv2 = HeteroConv(conv2_map, aggr='sum')
@@ -120,49 +123,10 @@ class ReconstructorHGNN(nn.Module):
             else:
                 print(f"Edge Type: {edge_type}, No edge weight provided.")
 
-        # 检查 edge_index 是否超出 x_dict 中对应节点类型的范围
-        for edge_type, edge_index in edge_index_dict.items():
-            src_node_type, _, dst_node_type = edge_type
-            num_src_nodes = x_dict[src_node_type].size(0)
-            num_dst_nodes = x_dict[dst_node_type].size(0)
-            if edge_index.numel() > 0:
-                src_max = edge_index[0].max().item()
-                dst_max = edge_index[1].max().item()
-                if src_max >= num_src_nodes:
-                    print(
-                        f"Error: Edge index out of bounds for source node type '{src_node_type}' in edge type {edge_type}. Max index: {src_max}, Node count: {num_src_nodes}")
-                if dst_max >= num_dst_nodes:
-                    print(
-                        f"Error: Edge index out of bounds for destination node type '{dst_node_type}' in edge type {edge_type}. Max index: {dst_max}, Node count: {num_dst_nodes}")
-            else:
-                print(f"Edge Type: {edge_type} has no edges.")
-
-        for edge_type, edge_index in edge_index_dict.items():
-            src_type, relation, dst_type = edge_type
-            if edge_index.size(0) > 0:
-                max_src_idx = edge_index[0].max().item()
-                max_dst_idx = edge_index[1].max().item()
-
-                if max_src_idx >= x_dict[src_type].size(0):
-                    print(
-                        f"Error: Edge index source node {max_src_idx} out of bounds for {src_type} with node count {x_dict[src_type].size(0)}")
-
-                if max_dst_idx >= x_dict[dst_type].size(0):
-                    print(
-                        f"Error: Edge index destination node {max_dst_idx} out of bounds for {dst_type} with node count {x_dict[dst_type].size(0)}")
-
-        # 在 conv1 中检查每种连接类型的输出
-        for edge_type, conv in self.conv1.convs.items():
-            print(f"Applying conv for edge type: {edge_type}")
-            try:
-                out = conv(x_dict[edge_type[0]], edge_index_dict[edge_type], edge_weight_dict.get(edge_type, None))
-                print(f"Conv output shape: {out.shape}")
-            except ValueError as e:
-                print(f"Error during conv for edge type {edge_type}: {e}")
-                raise
-
+        x_dict = self.conv1(x_dict, edge_index_dict, edge_weight_dict)
         x_dict = {key: F.relu(x) for key, x in x_dict.items()}
         x_dict = self.conv2(x_dict, edge_index_dict, edge_weight_dict)
+        # 20240911 dhj 通过节点类型异构网络 生成新的节点表示，dict{5}--> dict{'education': shape(29, 11), 'gaming': shape(31, 11), 'tools': shape(28, 11), 'social': shape(30, 11), 'health': shape(32, 11)}
         return x_dict
 
 
