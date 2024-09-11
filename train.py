@@ -25,9 +25,6 @@ G = construct_data_model(num_apps=150, traffic_mean=10, traffic_std_dev=0.4, yie
                         cost_fixed_min=100, cost_fixed_max=500, cost_variable_ratio=0.02)
 # m = G.nodes.get('App_0')
 nodes_features_list = [G.nodes.get('App_' + str(item))['features'].tolist() for item in range(0, 150)]
-
-# todo: dhj获取当前所有节点的traffic
-nodes_traffic_list = [G.nodes.get('App_' + str(item))['traffic'] for item in range(0, 150)]
 data = HeteroData()
 
 # 类别节点
@@ -44,11 +41,9 @@ app_data = torch.tensor(np.array(nodes_features_list), dtype=torch.float32)
 nodes_list = [G.nodes.get("App_" + str(item)) for item in range(num_apps)]
 
 # 获取节点流量
-# traffic_mean = 10.
-# traffic_std_dev = 0.4
-# # todo dhj traffic 取样不对  应该取样上一步构建的流量参数
-# traffic = torch.normal(mean=torch.full((num_apps,), traffic_mean), std=torch.full((num_apps,), traffic_std_dev))
-
+'''
+这里已经拿到了当前时间切片的节点流量
+'''
 traffic_list = [node['traffic'] for node in nodes_list]
 traffic = torch.tensor(traffic_list)
 
@@ -150,16 +145,22 @@ full_connection_edge_weight = torch.ones(num_apps * (num_apps - 1) // 2, dtype=t
 class AttentionLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(AttentionLayer, self).__init__()
+        self.scale = in_channels ** -0.5
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.linear = nn.Linear(self.in_channels, self.out_channels * 3)
+        self.layer_norm = nn.LayerNorm(self.in_channels)
+        self.linear = nn.Linear(self.in_channels, self.out_channels * 3, bias=False)
 
     def forward(self, x):
+        x = self.layer_norm(x)
         x = self.linear(x)
         q, k, v = torch.chunk(x, 3, dim=1)
-        attn = torch.matmul(q, k.transpose(1, 0))
-        attn = F.softmax(attn, dim=-1)
-        return torch.matmul(attn, v)
+        q = q * self.scale
+        sim = torch.einsum("...i d, ...j d->...i j", q, k)
+        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
+        attn = F.softmax(sim, dim = -1)
+        out = torch.einsum("...i j, ...j d->...i d", attn, v)
+        return out
 
 class AttentionNetwork(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -177,7 +178,7 @@ attention_network = AttentionNetwork(in_channels=11, out_channels=11)
 def update_edge_weight(edge_index, app_data, edge_weight, traffic, threshold=0.1, alpha=0.5):
     # 节点的注意力权重
     attn_weights = attention_network(app_data)
-    # 边的权重==边的两个断点节点的注意力权重的乘积
+    # 边的权重==边的两个端点节点的注意力权重的乘积
     edge_weight = torch.sum(attn_weights[edge_index[0]] * attn_weights[edge_index[1]], dim=1)
     # 计算一条边两端点节点的流量差异值，并计算绝对值
     traffic_diff = torch.abs(traffic[edge_index[0]] - traffic[edge_index[1]])
@@ -188,8 +189,6 @@ def update_edge_weight(edge_index, app_data, edge_weight, traffic, threshold=0.1
     return new_edge_index, new_edge_weight
 
 # 2.3 得到新的数据共享网络
-
-
 new_edge_index, new_edge_weight = update_edge_weight(edge_index=full_connection_edge_index,
                                                      edge_weight=full_connection_edge_weight,
                                                      app_data=output_dict['app'],
@@ -227,7 +226,6 @@ class MyNewMessagePassing(MessagePassing):
 
     def message(self, x_j, weight):
         # todo:传输规则
-        # todo : 流量可以在traffic_list中获取 traffic_list[0] 表示的是App_0的流量
         # chazhi =
         return x_j if weight is None else x_j * weight
 
