@@ -2,7 +2,7 @@
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import MessagePassing, HeteroConv, SAGEConv
 from torch_geometric.data import HeteroData
 import numpy as np
 from ConstructData import *
@@ -18,13 +18,157 @@ categories_map = dict(zip(categories_list, range(len(categories_list))))
 developer_types_list = ['individual', 'company']
 developer_types_map = dict(zip(developer_types_list, range(len(developer_types_list))))
 
-
 num_apps = 150
 # 通过上一步构建的当前时间节点的图网络结构
 G = construct_data_model(num_apps=150, traffic_mean=10, traffic_std_dev=0.4, yield_rate_min=0.04, yield_rate_max=0.14,
-                        cost_fixed_min=100, cost_fixed_max=500, cost_variable_ratio=0.02)
+                         cost_fixed_min=100, cost_fixed_max=500, cost_variable_ratio=0.02)
 # m = G.nodes.get('App_0')
 nodes_features_list = [G.nodes.get('App_' + str(item))['features'].tolist() for item in range(0, 150)]
+
+# 2024-09-11 dhj
+# 添加categories节点类别序列
+categories = ['education', 'gaming', 'tools', 'social', 'health']
+
+
+# 2024-09-11 dhj
+# 构建异构数据 这里构建异构数据是通过节点类型来进行的
+def create_hetero_data(G, categories):
+    """
+    :param G: 当前时间切片下的图结构
+    :param categories: 节点类型节点的类型list
+    :return:
+    """
+    # 构建节点和边的字典
+    hetero_data = HeteroData()
+    # 节点到索引的映射
+    node_idx_map = {}
+    # 构建异构节点数据
+    for category in categories:
+        node_indices = [node for node in G.nodes if G.nodes[node]['category'] == category]
+        print(node_indices)
+        app_features = [G.nodes[node]['features'] for node in node_indices]
+        hetero_data[category].x = torch.tensor(app_features, dtype=torch.float)
+
+        # 为每种类别的节点创建一个节点到索引的映射
+        node_idx_map[category] = {node: i for i, node in enumerate(node_indices)}
+
+    # 为异构数据添加边以及权重，连接相同类别的节点
+    for category in categories:
+        edge_index = []
+        edge_weight = []
+        hetero_data[category, 'connected_to', category].edge_index = torch.empty((2, 0), dtype=torch.long)
+        hetero_data[category, 'connected_to', category].edge_weight = torch.empty((0,), dtype=torch.float)
+
+        for u, v, data in G.edges(data=True):
+            if G.nodes[u]['category'] == category and G.nodes[v]['category'] == category:
+                edge_index.append([node_idx_map[category][u], node_idx_map[category][v]])
+                edge_weight.append(int(data['weight']))
+
+        # 检查空边
+        if len(edge_index) > 0:
+            edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+            hetero_data[category, 'connected_to', category].edge_index = edge_index_tensor
+
+        if len(edge_weight) > 0:
+            edge_weight_tensor = torch.tensor(edge_weight, dtype=torch.float)
+            hetero_data[category, 'connected_to', category].edge_weight = edge_weight_tensor
+
+    return hetero_data
+
+
+hetero_data = create_hetero_data(G, categories)
+
+
+# 定义一个两层的异构图神经网络 来获取新的节点表征
+class ReconstructorHGNN(nn.Module):
+    def __init__(self, meta_data, hidden_dim, out_dim):
+        super(ReconstructorHGNN, self).__init__()
+        self.meta_data = meta_data
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+
+        conv1_map = {}
+        conv2_map = {}
+
+        # 获取实际存在的连接类型
+        existing_edge_types = meta_data[1]
+
+        for connection in existing_edge_types:
+            conv1_map[connection] = SAGEConv((-1, -1), hidden_dim)
+            conv2_map[connection] = SAGEConv((-1, -1), out_dim)
+
+        self.conv1 = HeteroConv(conv1_map, aggr='sum')
+        self.conv2 = HeteroConv(conv2_map, aggr='sum')
+
+    def forward(self, hetero_data):
+        x_dict = hetero_data.x_dict
+        edge_index_dict = hetero_data.edge_index_dict
+        edge_weight_dict = hetero_data.edge_weight_dict
+
+        print("\nChecking node features:")
+        for node_type, x in x_dict.items():
+            print(f"Node Type: {node_type}, Feature shape: {x.shape}")
+
+        print("\nChecking edge indices:")
+        for edge_type, edge_index in edge_index_dict.items():
+            print(f"Edge Type: {edge_type}, Edge Index shape: {edge_index.shape}")
+
+        print("\nChecking edge weights:")
+        for edge_type, edge_weight in edge_weight_dict.items():
+            if edge_weight is not None:
+                print(f"Edge Type: {edge_type}, Edge Weight shape: {edge_weight.shape}")
+            else:
+                print(f"Edge Type: {edge_type}, No edge weight provided.")
+
+        # 检查 edge_index 是否超出 x_dict 中对应节点类型的范围
+        for edge_type, edge_index in edge_index_dict.items():
+            src_node_type, _, dst_node_type = edge_type
+            num_src_nodes = x_dict[src_node_type].size(0)
+            num_dst_nodes = x_dict[dst_node_type].size(0)
+            if edge_index.numel() > 0:
+                src_max = edge_index[0].max().item()
+                dst_max = edge_index[1].max().item()
+                if src_max >= num_src_nodes:
+                    print(
+                        f"Error: Edge index out of bounds for source node type '{src_node_type}' in edge type {edge_type}. Max index: {src_max}, Node count: {num_src_nodes}")
+                if dst_max >= num_dst_nodes:
+                    print(
+                        f"Error: Edge index out of bounds for destination node type '{dst_node_type}' in edge type {edge_type}. Max index: {dst_max}, Node count: {num_dst_nodes}")
+            else:
+                print(f"Edge Type: {edge_type} has no edges.")
+
+        for edge_type, edge_index in edge_index_dict.items():
+            src_type, relation, dst_type = edge_type
+            if edge_index.size(0) > 0:
+                max_src_idx = edge_index[0].max().item()
+                max_dst_idx = edge_index[1].max().item()
+
+                if max_src_idx >= x_dict[src_type].size(0):
+                    print(
+                        f"Error: Edge index source node {max_src_idx} out of bounds for {src_type} with node count {x_dict[src_type].size(0)}")
+
+                if max_dst_idx >= x_dict[dst_type].size(0):
+                    print(
+                        f"Error: Edge index destination node {max_dst_idx} out of bounds for {dst_type} with node count {x_dict[dst_type].size(0)}")
+
+        # 在 conv1 中检查每种连接类型的输出
+        for edge_type, conv in self.conv1.convs.items():
+            print(f"Applying conv for edge type: {edge_type}")
+            try:
+                out = conv(x_dict[edge_type[0]], edge_index_dict[edge_type], edge_weight_dict.get(edge_type, None))
+                print(f"Conv output shape: {out.shape}")
+            except ValueError as e:
+                print(f"Error during conv for edge type {edge_type}: {e}")
+                raise
+
+        x_dict = {key: F.relu(x) for key, x in x_dict.items()}
+        x_dict = self.conv2(x_dict, edge_index_dict, edge_weight_dict)
+        return x_dict
+
+
+model = ReconstructorHGNN(hetero_data.metadata(), hidden_dim=11, out_dim=11)
+
+m = model(hetero_data)
 data = HeteroData()
 
 # 类别节点
@@ -35,7 +179,6 @@ developer_type_data = torch.randn(2, 10)
 data['developer_type'].x = developer_type_data
 # app节点
 app_data = torch.tensor(np.array(nodes_features_list), dtype=torch.float32)
-
 
 # 异构边 edge_index
 nodes_list = [G.nodes.get("App_" + str(item)) for item in range(num_apps)]
@@ -70,9 +213,9 @@ edge_weight_developer_to_app = torch.tensor(
 edge_weight_app_to_category = torch.tensor(
     np.array([category_weight_dict[node["category"]] for node in nodes_list]), dtype=torch.float32)
 
-
 data["app", "belongs_to", "category"].edge_index = app_to_category_edge
 data["developer_type", "develops", "app"].edge_index = developer_to_app_type_edge
+
 
 class MyMessagePassing(MessagePassing):
     def __init__(self, node_types, edge_types, in_channels, out_channels):
@@ -88,7 +231,8 @@ class MyMessagePassing(MessagePassing):
         })
 
     def forward(self, x_dict, edge_index_dict, edge_weight_dict):
-        out = {ntype: torch.zeros(x_dict[ntype].size(0), self.out_channels[ntype], device=x_dict[ntype].device, dtype=torch.float)
+        out = {ntype: torch.zeros(x_dict[ntype].size(0), self.out_channels[ntype], device=x_dict[ntype].device,
+                                  dtype=torch.float)
                for ntype in self.node_types}
 
         for (src_type, relation_ship, dest_type), edge_index in edge_index_dict.items():
@@ -97,7 +241,8 @@ class MyMessagePassing(MessagePassing):
             if src_type in self.in_channels and src_type in self.out_channels:
                 src_x = self.linear_dict[src_type](src_x)
                 src_x = torch.relu(src_x)
-            mid_message = self.propagate(edge_index=edge_index, size=(x_dict[src_type].size(0), x_dict[dest_type].size(0)),
+            mid_message = self.propagate(edge_index=edge_index,
+                                         size=(x_dict[src_type].size(0), x_dict[dest_type].size(0)),
                                          x=src_x, weight=weight.view(-1, 1))
             out[dest_type] += mid_message
         return out
@@ -107,9 +252,11 @@ class MyMessagePassing(MessagePassing):
             return x_j * weight
         return x_j
 
+
 in_channels = {'developer_type': 10, 'category': 10, 'app': 11}
 out_channels = {'developer_type': 11, 'category': 11, 'app': 11}
 hidden_channels = {'developer_type': 15, 'category': 15, 'app': 15}
+
 
 class MyHGNN(nn.Module):
     def __init__(self, node_types, edge_types, in_channels, hidden_channels, out_channels):
@@ -121,6 +268,7 @@ class MyHGNN(nn.Module):
         x_dict = self.layer1(x_dict, edge_index_dict, edge_weight_dict)
         x_dict = self.layer2(x_dict, edge_index_dict, edge_weight_dict)
         return x_dict
+
 
 x_dict = {'developer_type': developer_type_data, 'category': categories_data, 'app': app_data}
 edge_index_dict = {
@@ -138,8 +286,10 @@ output_dict = model(x_dict, edge_index_dict, edge_weight_dict)
 #1.3 通过异构图卷积聚合得到的新的节点表示
 num_apps = output_dict['app'].size(0)
 #2.1 构建全连接网络
-full_connection_edge_index = torch.tensor([[i, j] for i in range(num_apps) for j in range(i+1, num_apps)], dtype=torch.long).t().contiguous()
+full_connection_edge_index = torch.tensor([[i, j] for i in range(num_apps) for j in range(i + 1, num_apps)],
+                                          dtype=torch.long).t().contiguous()
 full_connection_edge_weight = torch.ones(num_apps * (num_apps - 1) // 2, dtype=torch.float32)
+
 
 # 2.2 全连接网络的注意力层
 class AttentionLayer(nn.Module):
@@ -157,10 +307,11 @@ class AttentionLayer(nn.Module):
         q, k, v = torch.chunk(x, 3, dim=1)
         q = q * self.scale
         sim = torch.einsum("...i d, ...j d->...i j", q, k)
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = F.softmax(sim, dim = -1)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        attn = F.softmax(sim, dim=-1)
         out = torch.einsum("...i j, ...j d->...i d", attn, v)
         return out
+
 
 class AttentionNetwork(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -170,6 +321,7 @@ class AttentionNetwork(nn.Module):
     def forward(self, x):
         x = self.attention(x)
         return x
+
 
 attention_network = AttentionNetwork(in_channels=11, out_channels=11)
 
@@ -187,6 +339,7 @@ def update_edge_weight(edge_index, app_data, edge_weight, traffic, threshold=0.1
     new_edge_index = edge_index[:, mask]
     new_edge_weight = edge_weight[mask] * alpha
     return new_edge_index, new_edge_weight
+
 
 # 2.3 得到新的数据共享网络
 new_edge_index, new_edge_weight = update_edge_weight(edge_index=full_connection_edge_index,
@@ -219,7 +372,7 @@ class MyNewMessagePassing(MessagePassing):
             src_x = x_dict[src_type]
             src_x = self.linears[src_type](src_x)
             mid_message = self.propagate(edge_index, size=(src_x.size(0), src_x.size(0)),
-                           x=src_x, weight=weight.view(-1, 1))
+                                         x=src_x, weight=weight.view(-1, 1))
             out[dest_type] += mid_message
 
         return out
@@ -228,6 +381,7 @@ class MyNewMessagePassing(MessagePassing):
         # todo:传输规则
         # chazhi =
         return x_j if weight is None else x_j * weight
+
 
 class MyNewGNN(nn.Module):
     def __init__(self, node_types, edge_types, in_channels, hidden_channels, out_channels):
@@ -239,6 +393,7 @@ class MyNewGNN(nn.Module):
         x_dict = self.layer1(x_dict, edge_index_dict, edge_weight_dict)
         x_dict = self.layer2(x_dict, edge_index_dict, edge_weight_dict)
         return x_dict
+
 
 New_NODE_TYPES = ["app"]
 New_EDGE_TYPES = [('app', 'connects', 'app')]
@@ -261,6 +416,7 @@ msg_output_dict = msg_passing_model(new_x_dict, new_app_edge_index_dict, new_app
 
 print(msg_output_dict)
 
+
 # 定义损失函数
 def compute_loss(output_dict, traffic, cost):
     # 损失函数：考虑产出率和成本
@@ -268,6 +424,7 @@ def compute_loss(output_dict, traffic, cost):
     service_efficiency = yield_rate * traffic - cost
     loss = -torch.mean(service_efficiency)
     return loss, torch.mean(service_efficiency)
+
 
 # 模型、优化器
 model = MyNewGNN(New_NODE_TYPES, New_EDGE_TYPES, new_in_channels, new_hidden_channels, new_out_channels)
@@ -283,4 +440,3 @@ for epoch in range(100):  # 示例训练100个epoch
     loss.backward(retain_graph=True)
     optimizer.step()
     print(f"Epoch {epoch + 1}, Loss: {loss.item()}, 系统服务效能: {service_efficiency.item()}")
-
