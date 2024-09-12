@@ -7,30 +7,24 @@ from torch_geometric.data import HeteroData
 import numpy as np
 from ConstructData import *
 
-# 节点类型
-NODE_TYPES = ['developer_type', 'category', 'app']
-
-# 边类型
-EDGE_TYPES = [('developer_type', 'develops', 'app'), ('app', 'belongs_to', 'category')]
-
-categories_list = ['education', 'gaming', 'tools', 'social', 'health']
-categories_map = dict(zip(categories_list, range(len(categories_list))))
-developer_types_list = ['individual', 'company']
-developer_types_map = dict(zip(developer_types_list, range(len(developer_types_list))))
-
 num_apps = 150
 # 通过上一步构建的当前时间节点的图网络结构
 G = construct_data_model(num_apps=150, traffic_mean=10, traffic_std_dev=0.4, yield_rate_min=0.04, yield_rate_max=0.14,
                          cost_fixed_min=100, cost_fixed_max=500, cost_variable_ratio=0.02)
 # m = G.nodes.get('App_0')
-nodes_features_list = [G.nodes.get('App_' + str(item))['features'].tolist() for item in range(0, 150)]
-
 # 2024-09-11 dhj
 # 添加categories节点类别序列
 categories = ['education', 'gaming', 'tools', 'social', 'health']
+# 所有节点的流量使用效率map
+nodes_yield_rate_map = {node: G.nodes[node]['yield_rate'] for node in G.nodes}
+# 所有节点的流量map
+nodes_traffic_map = {node: G.nodes[node]['traffic'] for node in G.nodes}
+# 所有节点的花费map
+nodes_cost_map = {node: G.nodes[node]['cost'] for node in G.nodes}
 # 2024-09-11 dhj
 # 构建类别索引到node的映射
 idx_node_map = {}
+
 
 # 2024-09-11 dhj
 # 构建异构数据 这里构建异构数据是通过节点类型来进行的
@@ -47,7 +41,6 @@ def create_hetero_data(G, categories):
     # 构建异构节点数据
     for category in categories:
         node_indices = [node for node in G.nodes if G.nodes[node]['category'] == category]
-        print(node_indices)
         app_features = [G.nodes[node]['features'] for node in node_indices]
         hetero_data[category].x = torch.tensor(app_features, dtype=torch.float)
 
@@ -108,21 +101,6 @@ class ReconstructorHGNN(nn.Module):
         edge_index_dict = hetero_data.edge_index_dict
         edge_weight_dict = hetero_data.edge_weight_dict
 
-        print("\nChecking node features:")
-        for node_type, x in x_dict.items():
-            print(f"Node Type: {node_type}, Feature shape: {x.shape}")
-
-        print("\nChecking edge indices:")
-        for edge_type, edge_index in edge_index_dict.items():
-            print(f"Edge Type: {edge_type}, Edge Index shape: {edge_index.shape}")
-
-        print("\nChecking edge weights:")
-        for edge_type, edge_weight in edge_weight_dict.items():
-            if edge_weight is not None:
-                print(f"Edge Type: {edge_type}, Edge Weight shape: {edge_weight.shape}")
-            else:
-                print(f"Edge Type: {edge_type}, No edge weight provided.")
-
         x_dict = self.conv1(x_dict, edge_index_dict, edge_weight_dict)
         x_dict = {key: F.relu(x) for key, x in x_dict.items()}
         x_dict = self.conv2(x_dict, edge_index_dict, edge_weight_dict)
@@ -130,277 +108,221 @@ class ReconstructorHGNN(nn.Module):
         return x_dict
 
 
-model = ReconstructorHGNN(hetero_data.metadata(), hidden_dim=11, out_dim=11)
+# 20240912 dhj 利用新的节点生成全连接图
+class Generate_Full_Connect_Graph:
+    def __init__(self, out_dim):
+        # 所有节点的节点index 和 节点名称的映射
+        self.all_index_node_map = {}
+        # 所有节点的节点名称 和 节点index的映射
+        self.all_node_index_map = {}
+        # 所有节点
+        self.all_node = []
+        # 所有特征节点
+        self.all_feature_node = torch.empty((0, out_dim), dtype=torch.float)
 
-m = model(hetero_data)
-data = HeteroData()
+    def cat_all_node(self, x_dict):
+        # 拼接生成所有节点, 更新所有节点index和节点名称的双向映射
+        all_node = []
+        all_index = 0
+        for category in categories:
+            x_category = x_dict[category]
+            self.all_feature_node = torch.cat([self.all_feature_node, x_category], dim=0)
+            for index in range(x_category.shape[0]):
+                self.all_node_index_map[idx_node_map[category][index]] = all_index
+                self.all_index_node_map[all_index] = idx_node_map[category][index]
+                all_node.append(all_index)
+                all_index += 1
+        return torch.tensor(all_node)
 
-# 类别节点
-categories_data = torch.randn(5, 10)
-data['category'].x = categories_data
-# 开发者节点
-developer_type_data = torch.randn(2, 10)
-data['developer_type'].x = developer_type_data
-# app节点
-app_data = torch.tensor(np.array(nodes_features_list), dtype=torch.float32)
+    def generate_full_connect_graph(self, x_dict):
+        # 生成全连接的边
+        self.all_node = self.cat_all_node(x_dict)
+        # print(f"all_node.shape[0] is {self.all_node.shape[0]}")
+        all_edge_index = []
+        for u in range(self.all_node.shape[0]):
+            # print(f"u = {u}, src Node {self.all_index_node_map[u]}")
+            for v in range(u + 1, self.all_node.shape[0]):
+                # print(f"v = {v}, dst Node {self.all_index_node_map[v]}")
+                all_edge_index.append([u, v])
 
-# 异构边 edge_index
-nodes_list = [G.nodes.get("App_" + str(item)) for item in range(num_apps)]
-
-# 获取节点流量
-'''
-这里已经拿到了当前时间切片的节点流量
-'''
-traffic_list = [node['traffic'] for node in nodes_list]
-traffic = torch.tensor(traffic_list)
-
-nodes_categories_list = [int(categories_map[node["category"]]) for node in nodes_list]
-nodes_app_list = [int(node["id"].split('_')[1]) for node in nodes_list]
-nodes_developer_type_list = [int(developer_types_map[node["developer_type"]]) for node in nodes_list]
-# 构造开发者到应用的边
-developer_to_app_type_edge = torch.tensor(np.array([nodes_developer_type_list, nodes_app_list]), dtype=torch.long)
-# 构造应用到类别的边
-app_to_category_edge = torch.tensor(np.array([nodes_app_list, nodes_categories_list]), dtype=torch.long)
-
-# 类别权重字典
-category_weight_dict = {
-    'education': 1.2, 'gaming': 1.5, 'tools': 1.0, 'social': 1.8, 'health': 1.3
-}
-# 开发者权重字典
-developer_type_weights_dict = {
-    'individual': 0.8, 'company': 1.2
-}
-# 开发者到应用的边权重
-edge_weight_developer_to_app = torch.tensor(
-    np.array([developer_type_weights_dict[node["developer_type"]] for node in nodes_list]), dtype=torch.float32)
-# 应用到类别的边权重
-edge_weight_app_to_category = torch.tensor(
-    np.array([category_weight_dict[node["category"]] for node in nodes_list]), dtype=torch.float32)
-
-data["app", "belongs_to", "category"].edge_index = app_to_category_edge
-data["developer_type", "develops", "app"].edge_index = developer_to_app_type_edge
+        # 转换all_edge_index向量
+        all_edge_index = torch.tensor(all_edge_index, dtype=torch.long).t().contiguous()
+        return all_edge_index
 
 
-class MyMessagePassing(MessagePassing):
-    def __init__(self, node_types, edge_types, in_channels, out_channels):
-        super(MyMessagePassing, self).__init__(aggr='add')
-        self.node_types = node_types
-        self.edge_types = edge_types
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+# 2024-09-11 dhj 构建一个线性注意力网络 初始化/调整权重参数
+class LinearAttention(nn.Module):
+    def __init__(self, in_dim):
+        super(LinearAttention, self).__init__()
+        self.attention = nn.Linear(2 * in_dim, 1)
 
-        self.linear_dict = nn.ModuleDict({
-            node_type: nn.Linear(in_channels.get(node_type, 0), out_channels.get(node_type, 0))
-            for node_type in self.node_types
-        })
+    def forward(self, x_list, edge_index):
+        edge_weight = []
+        num_edge = edge_index.shape[1]
+        for i in range(num_edge):
+            # 获取每条边的端点的index
+            u_index = edge_index[0][i]
+            v_index = edge_index[1][i]
+            # 获取每条边的两个端点的特征
+            u_feature = x_list[u_index]
+            v_feature = x_list[v_index]
 
-    def forward(self, x_dict, edge_index_dict, edge_weight_dict):
-        out = {ntype: torch.zeros(x_dict[ntype].size(0), self.out_channels[ntype], device=x_dict[ntype].device,
-                                  dtype=torch.float)
-               for ntype in self.node_types}
+            cat_feature = torch.cat([u_feature, v_feature], dim=-1)
+            weight_logits = self.attention(cat_feature)
+            edge_weight.append(weight_logits)
+        # 遍历 edge_weight 中的每一个 tensor，进行标准化
+        cnty = 0
+        cat_edge_weight = torch.cat(edge_weight, dim=0).type(torch.float)
+        normalized_edge_weight = (cat_edge_weight - torch.mean(cat_edge_weight, dim=0)) / torch.std(cat_edge_weight,
+                                                                                                    dim=0)
+        edge_weight_out = torch.sigmoid(normalized_edge_weight)
+        return edge_weight_out
 
-        for (src_type, relation_ship, dest_type), edge_index in edge_index_dict.items():
-            weight = edge_weight_dict[(src_type, relation_ship, dest_type)]
-            src_x = x_dict[src_type]
-            if src_type in self.in_channels and src_type in self.out_channels:
-                src_x = self.linear_dict[src_type](src_x)
-                src_x = torch.relu(src_x)
-            mid_message = self.propagate(edge_index=edge_index,
-                                         size=(x_dict[src_type].size(0), x_dict[dest_type].size(0)),
-                                         x=src_x, weight=weight.view(-1, 1))
-            out[dest_type] += mid_message
-        return out
+# 2024-09-12 dhj 设计一个新的图网络，进行流量传输操作，最大化网络服务效能
+class MessagePassingNet(nn.Module):
+    def __init__(self, n):
+        """
+        :param n: 惩罚系数
+        """
+        super(MessagePassingNet, self).__init__()
+        self.n = n
 
-    def message(self, x_j, weight):
-        if weight is not None:
-            return x_j * weight
-        return x_j
+    def forward(self, _edge_index, _edge_weight, _nodes_yield_rate_map, _nodes_traffic_map, _nodes_cost_map,
+                _all_index_node_map=None, _all_node_index_map=None):
+        self.all_index_node_map = _all_index_node_map
+        self.all_node_index_map = _all_node_index_map
 
+        # 转换 traffic, yield_rate, 和 cost 到 Tensor 形式，保持计算图
+        nodes_yield_rate_tensor = torch.tensor([_nodes_yield_rate_map[node] for node in _all_index_node_map.values()],
+                                               dtype=torch.float32, requires_grad=True)
+        nodes_traffic_tensor = torch.tensor([_nodes_traffic_map[node] for node in _all_index_node_map.values()],
+                                            dtype=torch.float32, requires_grad=True)
+        nodes_cost_tensor = torch.tensor([_nodes_cost_map[node] for node in _all_index_node_map.values()],
+                                         dtype=torch.float32, requires_grad=True)
 
-in_channels = {'developer_type': 10, 'category': 10, 'app': 11}
-out_channels = {'developer_type': 11, 'category': 11, 'app': 11}
-hidden_channels = {'developer_type': 15, 'category': 15, 'app': 15}
+        # 进行消息传递
+        new_nodes_traffic_tensor = self.message_passing_network(_edge_index, _edge_weight, nodes_traffic_tensor)
 
+        # 计算新的总服务效能
+        total_service_efficiency = self.cal_service_efficiency(nodes_yield_rate_tensor, new_nodes_traffic_tensor,
+                                                               nodes_cost_tensor)
+        return new_nodes_traffic_tensor, total_service_efficiency
 
-class MyHGNN(nn.Module):
-    def __init__(self, node_types, edge_types, in_channels, hidden_channels, out_channels):
-        super(MyHGNN, self).__init__()
-        self.layer1 = MyMessagePassing(node_types, edge_types, in_channels, hidden_channels)
-        self.layer2 = MyMessagePassing(node_types, edge_types, hidden_channels, out_channels)
+    def message_passing_network(self, _edge_index, _edge_weight, _nodes_traffic_tensor):
+        # 创建一个副本来存储更新后的流量，防止在计算过程中直接修改原始流量
+        new_nodes_traffic_tensor = _nodes_traffic_tensor.clone()
 
-    def forward(self, x_dict, edge_index_dict, edge_weight_dict):
-        x_dict = self.layer1(x_dict, edge_index_dict, edge_weight_dict)
-        x_dict = self.layer2(x_dict, edge_index_dict, edge_weight_dict)
-        return x_dict
+        edge_num = _edge_index.shape[1]
 
+        # 遍历所有的边，进行消息传递
+        for i in range(edge_num):
+            src = _edge_index[0][i]
+            dst = _edge_index[1][i]
+            weight = _edge_weight[i]
 
-x_dict = {'developer_type': developer_type_data, 'category': categories_data, 'app': app_data}
-edge_index_dict = {
-    ('developer_type', 'develops', 'app'): developer_to_app_type_edge,
-    ('app', 'belongs_to', 'category'): app_to_category_edge
-}
-edge_weight_dict = {
-    ('developer_type', 'develops', 'app'): edge_weight_developer_to_app,
-    ('app', 'belongs_to', 'category'): edge_weight_app_to_category
-}
+            # 获取src和dst的流量（使用原始流量进行计算，而不是直接修改的流量）
+            src_traffic = _nodes_traffic_tensor[src]
+            dst_traffic = _nodes_traffic_tensor[dst]
 
-model = MyHGNN(NODE_TYPES, EDGE_TYPES, in_channels, hidden_channels, out_channels)
-output_dict = model(x_dict, edge_index_dict, edge_weight_dict)
+            # 计算流量差
+            traffic_diff = src_traffic - dst_traffic
 
-#1.3 通过异构图卷积聚合得到的新的节点表示
-num_apps = output_dict['app'].size(0)
-#2.1 构建全连接网络
-full_connection_edge_index = torch.tensor([[i, j] for i in range(num_apps) for j in range(i + 1, num_apps)],
-                                          dtype=torch.long).t().contiguous()
-full_connection_edge_weight = torch.ones(num_apps * (num_apps - 1) // 2, dtype=torch.float32)
+            # 根据流量差传递流量，更新暂存的流量张量
+            if traffic_diff > 0:
+                transfer = traffic_diff * self.n * weight
+                new_nodes_traffic_tensor[src] = new_nodes_traffic_tensor[src] - transfer
+                new_nodes_traffic_tensor[dst] = new_nodes_traffic_tensor[dst] + transfer
+            elif traffic_diff < 0:
+                transfer = traffic_diff * self.n * weight
+                new_nodes_traffic_tensor[src] = new_nodes_traffic_tensor[src] + transfer
+                new_nodes_traffic_tensor[dst] = new_nodes_traffic_tensor[dst] - transfer
 
+        # 返回新的流量张量
+        return new_nodes_traffic_tensor
 
-# 2.2 全连接网络的注意力层
-class AttentionLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(AttentionLayer, self).__init__()
-        self.scale = in_channels ** -0.5
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.layer_norm = nn.LayerNorm(self.in_channels)
-        self.linear = nn.Linear(self.in_channels, self.out_channels * 3, bias=False)
-
-    def forward(self, x):
-        x = self.layer_norm(x)
-        x = self.linear(x)
-        q, k, v = torch.chunk(x, 3, dim=1)
-        q = q * self.scale
-        sim = torch.einsum("...i d, ...j d->...i j", q, k)
-        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
-        attn = F.softmax(sim, dim=-1)
-        out = torch.einsum("...i j, ...j d->...i d", attn, v)
-        return out
-
-
-class AttentionNetwork(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(AttentionNetwork, self).__init__()
-        self.attention = AttentionLayer(in_channels, out_channels)
-
-    def forward(self, x):
-        x = self.attention(x)
-        return x
+    def cal_service_efficiency(self, _nodes_yield_rate_tensor, _nodes_traffic_tensor, _nodes_cost_tensor):
+        # 计算服务效率：yield_rate * traffic - cost
+        total_efficiency = torch.sum(_nodes_yield_rate_tensor * _nodes_traffic_tensor - _nodes_cost_tensor)
+        return total_efficiency
 
 
-attention_network = AttentionNetwork(in_channels=11, out_channels=11)
+class MultiAppGraphNet(nn.Module):
+    def __init__(self, _hetero_data, hidden_dim, out_dim, threshold=0.3, n=0.2):
+        super(MultiAppGraphNet, self).__init__()
+        self.hetero_data = _hetero_data
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        # 阈值
+        self.threshold = threshold
+        # 惩罚系数
+        self.n = n
+        # 构建节点特征的异构网络
+        self.reconstructor_model = ReconstructorHGNN(hetero_data.metadata(), hidden_dim=self.hidden_dim,
+                                                     out_dim=self.out_dim)
 
+        # 构建全连接图网络
+        self.gfc = Generate_Full_Connect_Graph(out_dim=out_dim)
 
-# 更新边的权重
-def update_edge_weight(edge_index, app_data, edge_weight, traffic, threshold=0.1, alpha=0.5):
-    # 节点的注意力权重
-    attn_weights = attention_network(app_data)
-    # 边的权重==边的两个端点节点的注意力权重的乘积
-    edge_weight = torch.sum(attn_weights[edge_index[0]] * attn_weights[edge_index[1]], dim=1)
-    # 计算一条边两端点节点的流量差异值，并计算绝对值
-    traffic_diff = torch.abs(traffic[edge_index[0]] - traffic[edge_index[1]])
-    mask = traffic_diff > threshold
-    # 根据流量更新边和权重
-    new_edge_index = edge_index[:, mask]
-    new_edge_weight = edge_weight[mask] * alpha
-    return new_edge_index, new_edge_weight
+        # 权重线性注意力获取
+        self.linear_attention = LinearAttention(out_dim)
 
+        # 消息传递网络
+        # self.message_passing_net = MessagePassingNet(n=self.n)
 
-# 2.3 得到新的数据共享网络
-new_edge_index, new_edge_weight = update_edge_weight(edge_index=full_connection_edge_index,
-                                                     edge_weight=full_connection_edge_weight,
-                                                     app_data=output_dict['app'],
-                                                     traffic=traffic)
+    def filter_threshold_for_edge(self, _edge_index, _edge_weight):
+        # 根据阈值 筛选出需要保留的边
+        mask = _edge_weight > self.threshold
+        return _edge_index[:, mask], _edge_weight[mask]
 
+    def forward(self, _hetero_data):
+        # 异构网络构建节点特征
+        new_x_dict = self.reconstructor_model(_hetero_data)
+        # 构建全连接图
+        edge_index = self.gfc.generate_full_connect_graph(new_x_dict)
+        all_feature_node = self.gfc.all_feature_node
+        ## 所有节点的index到节点名的映射
+        all_index_node_map = self.gfc.all_index_node_map
+        ## 所有节点的节点名到index的映射
+        all_node_index_map = self.gfc.all_node_index_map
 
-# todo:流量更新的规则算法
-class MyNewMessagePassing(MessagePassing):
-    def __init__(self, node_types, edge_types, hidden_channels, out_channels):
-        super(MyNewMessagePassing, self).__init__(aggr='add')
-        self.node_types = node_types
-        self.edge_types = edge_types
-        self.hidden_channels = hidden_channels
-        self.out_channels = out_channels
+        # 线性注意力获取权重
+        edge_weight = self.linear_attention(all_feature_node, edge_index)
 
-        self.linears = nn.ModuleDict({
-            node_type: nn.Linear(hidden_channels.get(node_type, 0), out_channels.get(node_type, 0))
-            for node_type in self.node_types
-        })
+        # 根据阈值筛选 获取流量传输网络的边 和 权重
+        new_edge_index, new_edge_weight = self.filter_threshold_for_edge(_edge_index=edge_index,
+                                                                         _edge_weight=edge_weight)
 
-    def forward(self, x_dict, edge_index_dict: dict, edge_weight_dict: dict):
-        # 初始化输出字典
-        out = {ntype: torch.zeros(x.size(0), self.out_channels.get(ntype, 0), device=x.device)
-               for ntype, x in x_dict.items()}
-        # 遍历边
-        for (src_type, relation_ship, dest_type), edge_index in edge_index_dict.items():
-            weight = edge_weight_dict.get((src_type, relation_ship, dest_type), None)
-            src_x = x_dict[src_type]
-            src_x = self.linears[src_type](src_x)
-            mid_message = self.propagate(edge_index, size=(src_x.size(0), src_x.size(0)),
-                                         x=src_x, weight=weight.view(-1, 1))
-            out[dest_type] += mid_message
+        # 消息传递过程，计算新的流量图和总效能
+        # new_nodes_traffic_tensor, total_service_efficiency = self.message_passing_net(_edge_index=new_edge_index,
+        #                                                                               _edge_weight=new_edge_weight,
+        #                                                                               _nodes_yield_rate_map=nodes_yield_rate_map,
+        #                                                                               _nodes_traffic_map=nodes_traffic_map,
+        #                                                                               _nodes_cost_map=nodes_cost_map,
+        #                                                                               _all_index_node_map=all_index_node_map,
+        #                                                                               _all_node_index_map=all_node_index_map)
 
-        return out
+        # return total_service_efficiency
+        return edge_index.sum()
 
-    def message(self, x_j, weight):
-        # todo:传输规则
-        # chazhi =
-        return x_j if weight is None else x_j * weight
+# torch.autograd.set_detect_anomaly(True)
 
+model = MultiAppGraphNet(_hetero_data=hetero_data, hidden_dim=11, out_dim=11)
 
-class MyNewGNN(nn.Module):
-    def __init__(self, node_types, edge_types, in_channels, hidden_channels, out_channels):
-        super(MyNewGNN, self).__init__()
-        self.layer1 = MyNewMessagePassing(node_types, edge_types, in_channels, hidden_channels)
-        self.layer2 = MyNewMessagePassing(node_types, edge_types, hidden_channels, out_channels)
-
-    def forward(self, x_dict, edge_index_dict, edge_weight_dict):
-        x_dict = self.layer1(x_dict, edge_index_dict, edge_weight_dict)
-        x_dict = self.layer2(x_dict, edge_index_dict, edge_weight_dict)
-        return x_dict
-
-
-New_NODE_TYPES = ["app"]
-New_EDGE_TYPES = [('app', 'connects', 'app')]
-new_in_channels = {'app': 11}
-new_out_channels = {'app': 11}
-new_hidden_channels = {'app': 11}
-
-msg_passing_model = MyNewGNN(New_NODE_TYPES, New_EDGE_TYPES, new_in_channels, new_hidden_channels, new_out_channels)
-# reshape_new_edge_index = new_edge_index.transpose(1, 0)
-reshape_new_edge_index = new_edge_index
-
-new_app_edge_index_dict = {
-    ('app', 'connects', 'app'): reshape_new_edge_index
-}
-new_app_edge_weight_dict = {
-    ('app', 'connects', 'app'): new_edge_weight
-}
-new_x_dict = {'app': output_dict['app']}
-msg_output_dict = msg_passing_model(new_x_dict, new_app_edge_index_dict, new_app_edge_weight_dict)
-
-print(msg_output_dict)
-
-
-# 定义损失函数
-def compute_loss(output_dict, traffic, cost):
-    # 损失函数：考虑产出率和成本
-    yield_rate = torch.mean(output_dict['app'], dim=1)
-    service_efficiency = yield_rate * traffic - cost
-    loss = -torch.mean(service_efficiency)
-    return loss, torch.mean(service_efficiency)
-
-
-# 模型、优化器
-model = MyNewGNN(New_NODE_TYPES, New_EDGE_TYPES, new_in_channels, new_hidden_channels, new_out_channels)
-optimizer = optim.Adam(model.parameters(), lr=0.1)
-cost = torch.tensor([G.nodes[f'App_{i}']['cost'] for i in range(num_apps)], dtype=torch.float32)
-
-# 训练循环
-for epoch in range(100):  # 示例训练100个epoch
-    model.train()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+epochs = 100
+for epoch in range(epochs):
     optimizer.zero_grad()
-    msg_output_dict = model(new_x_dict, new_app_edge_index_dict, new_app_edge_weight_dict)
-    loss, service_efficiency = compute_loss(msg_output_dict, traffic, cost)
-    loss.backward(retain_graph=True)
+
+    # 调用模型的前向传播，得到效率的tensor
+    total_efficiency = model(hetero_data)
+
+    # 损失函数：最大化效能，即最小化负效能
+    loss = -total_efficiency
+
+    # 反向传播
+    loss.backward()
+
+    # 更新参数
     optimizer.step()
-    print(f"Epoch {epoch + 1}, Loss: {loss.item()}, 系统服务效能: {service_efficiency.item()}")
+
+    print(f'Epoch {epoch + 1}, Loss: {loss.item()}, Efficiency: {total_efficiency.item()}')
